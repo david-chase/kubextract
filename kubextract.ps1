@@ -1,8 +1,15 @@
 param(
 	[string]$instance,
 	[string]$user,
-	[string]$pass
+	[string]$pass,
+	[string]$outpath,
+	[string]$beep
 )
+
+#-----------------------------------------------------------------------------------------------
+#  kubexport 
+#  PowerShell script to query a customer instance and export relevant information as a CSV 
+#-----------------------------------------------------------------------------------------------
 
 function Get-IniSection {
 	param(
@@ -19,6 +26,7 @@ function Get-IniSection {
 
 	$inSection = $false
 	$result = @{}
+	$freeLines = @()
 
 	foreach ($line in $lines) {
 		$trim = $line.Trim()
@@ -43,12 +51,35 @@ function Get-IniSection {
 					$value = $rawValue
 				}
 				$result[$key] = $value
+			} else {
+				# If the line contains no '=' and is not a comment/blank, treat it as a free-form line (e.g., one field name per line)
+				$freeLines += $trim
 			}
 		}
 	}
 
+	if ($freeLines.Count -gt 0) { $result['__lines'] = $freeLines }
+
 	return $result
 }
+
+# CSV helper: escape a value for CSV
+function Escape-CsvValue {
+	param([object]$Value)
+	if ($null -eq $Value) { return '' }
+	$string = [string]$Value
+	if ($string -match '[",\n\r]') {
+		return '"' + ($string -replace '"','""') + '"'
+	}
+	return $string
+}
+
+#-----------------------------------------------------------------------------------------------
+# Begin main program
+#-----------------------------------------------------------------------------------------------
+Write-Host 
+Write-Host ::: Kubexport ::: -ForegroundColor Cyan
+Write-Host 
 
 # Locate kubextract.ini next to this script
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -68,6 +99,14 @@ $envValueUser = [Environment]::GetEnvironmentVariable($envVarNameUser)
 # pass parameter env var
 $envVarNamePass = 'kubexpass'
 $envValuePass = [Environment]::GetEnvironmentVariable($envVarNamePass)
+
+# outpath parameter env var
+$envVarNameOutPath = 'kubexoutpath'
+$envValueOutPath = [Environment]::GetEnvironmentVariable($envVarNameOutPath)
+
+# beep parameter env var
+$envVarNameBeep = 'kubexbeep'
+$envValueBeep = [Environment]::GetEnvironmentVariable($envVarNameBeep)
 
 # Precedence: CLI -> INI -> ENV
 if ($PSBoundParameters.ContainsKey('instance') -and $instance -ne $null -and $instance -ne '') {
@@ -114,6 +153,46 @@ if ($PSBoundParameters.ContainsKey('pass') -and $pass -ne $null -and $pass -ne '
 	$passSource = 'none'
 }
 
+# Resolve outpath with precedence: CLI -> INI -> ENV
+if ($PSBoundParameters.ContainsKey('outpath') -and $outpath -ne $null -and $outpath -ne '') {
+	$OutPath = $outpath
+	$outPathSource = 'cli'
+} elseif ($iniParams.ContainsKey('outpath') -and $iniParams['outpath'] -ne '') {
+	$OutPath = $iniParams['outpath']
+	$outPathSource = 'ini'
+} elseif ($envValueOutPath -ne $null -and $envValueOutPath -ne '') {
+	$OutPath = $envValueOutPath
+	$outPathSource = 'env'
+} else {
+	$OutPath = $null
+	$outPathSource = 'none'
+}
+
+# Resolve beep with precedence: CLI -> INI -> ENV (normalize to boolean)
+$Beep = $false
+$beepSource = 'none'
+function To-Bool([string]$v) {
+	if ($null -eq $v) { return $null }
+	switch ($v.Trim().ToLower()) {
+		'true' { return $true }
+		'false' { return $false }
+		'1' { return $true }
+		'0' { return $false }
+		default { return $null }
+	}
+}
+
+$cliBeep = $null
+if ($PSBoundParameters.ContainsKey('beep') -and $beep -ne $null -and $beep -ne '') { $cliBeep = To-Bool $beep }
+$iniBeep = $null
+if ($iniParams.ContainsKey('beep') -and $iniParams['beep'] -ne '') { $iniBeep = To-Bool $iniParams['beep'] }
+$envBeep = $null
+if ($envValueBeep -ne $null -and $envValueBeep -ne '') { $envBeep = To-Bool $envValueBeep }
+
+if ($cliBeep -ne $null) { $Beep = $cliBeep; $beepSource = 'cli' }
+elseif ($iniBeep -ne $null) { $Beep = $iniBeep; $beepSource = 'ini' }
+elseif ($envBeep -ne $null) { $Beep = $envBeep; $beepSource = 'env' }
+
 # Read Settings section (Protocol, BaseUrl, BaseApi)
 $settings = Get-IniSection -Path $iniPath -Section 'Settings'
 
@@ -130,16 +209,28 @@ function Trim-Quotes {
 $protocol = Trim-Quotes $settings['Protocol']
 $baseUrl  = Trim-Quotes $settings['BaseUrl']
 $baseApi  = Trim-Quotes $settings['BaseApi']
+$baseQL   = Trim-Quotes $settings['BaseQL']
 
 # Ensure BaseApi starts with a '/'
 if ($baseApi -ne $null -and -not $baseApi.StartsWith('/')) {
 	$baseApi = '/' + $baseApi
 }
 
+# Ensure BaseQL starts with a '/'
+if ($baseQL -ne $null -and -not $baseQL.StartsWith('/')) {
+    $baseQL = '/' + $baseQL
+}
+
 # Build endpoint as Protocol + instance + "." + BaseUrl + BaseApi
 $endpoint = ""
 if ($protocol -and $Instance -and $baseUrl -and $baseApi) {
 	$endpoint = "$protocol$Instance.$baseUrl$baseApi"
+}
+
+# Construct GraphQL base URL: Protocol + instance + "." + BaseUrl + BaseQL
+$graphqlEndpoint = ""
+if ($protocol -and $Instance -and $baseUrl -and $baseQL) {
+    $graphqlEndpoint = "$protocol$Instance.$baseUrl$baseQL"
 }
 
 # Function: Get an auth token by POSTing credentials to endpoint/authorize
@@ -152,9 +243,6 @@ function Get-AuthToken {
 
 	# Ensure single slash before 'authorize'
 	$authUrl = $Endpoint.TrimEnd('/') + '/authorize'
-
-    write-host $authUrl
-
 	$hHeaders = @{ "Accept" = "application/json"; "Content-Type" = "application/json" }
 	$hBody = @{ userName = $User; pwd = $Pass }
 
@@ -172,15 +260,131 @@ if ($endpoint) {
 	$AuthToken = Get-AuthToken -Endpoint $endpoint -User $User -Pass $Pass
 }
 
-# Print the auth token (prefer the apiToken field if present)
+# Check and extract token value
+$tokenValue = $null
 if ($AuthToken -ne $null) {
 	if ($AuthToken.PSObject.Properties.Name -contains 'apiToken') {
-		Write-Output $AuthToken.apiToken
-	} else {
-		Write-Output $AuthToken
+		$tokenValue = $AuthToken.apiToken
+	} elseif ($AuthToken.PSObject.Properties.Name -contains 'token') {
+		$tokenValue = $AuthToken.token
+	} elseif ($AuthToken -is [string]) {
+		$tokenValue = $AuthToken
 	}
+}
+
+if (-not $tokenValue) {
+	Write-Output 'Authorization failed or token not found'
+	exit 1
 } else {
-	Write-Output ''
+	Write-Output 'Authorization token obtained'
+}
+
+
+# Read Queries section (list of query names) and execute each query via per-query sections
+$queries = Get-IniSection -Path $iniPath -Section 'Queries'
+$queryNames = @()
+if ($queries.ContainsKey('__lines')) {
+	$queryNames = $queries['__lines'] | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+} else {
+	$queryNames = $queries.Keys
+}
+
+foreach ($qKey in $queryNames) {
+	$queryNameSection = $qKey
+	$qcfg = Get-IniSection -Path $iniPath -Section $queryNameSection
+
+	$endPointName = $qcfg['EndPoint']
+	$gqlField = $qcfg['GraphQLQuery']
+	$viewId = $qcfg['viewId']
+	$filterId = $qcfg['filterId']
+	$treeviewPath = $qcfg['treeviewPath']
+
+	if (-not $endPointName -or -not $gqlField) {
+		Write-Output "Skipping query '$queryNameSection' - missing EndPoint or GraphQLQuery"
+		continue
+	}
+
+	# Build request URL: graphqlEndpoint + endpointName
+	$requestUrl = $graphqlEndpoint.TrimEnd('/') + '/' + $endPointName.TrimStart('/')
+
+	# Build args text (string values quoted)
+	$argsText = "viewId: `"$viewId`", filterId: `"$filterId`", treeviewPath: `"$treeviewPath`""
+
+	# Determine selection set: if the query section contains free-form lines (under __lines), treat them as field names (one per line)
+	$selection = "{ entityId }"
+	if ($qcfg.ContainsKey('__lines')) {
+		$lines = $qcfg['__lines'] | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+		if ($lines.Count -gt 0) {
+			$selBody = $lines -join "`n    "
+			$selection = "{`n    $selBody`n}"
+		}
+	}
+
+	# Build GraphQL operation using selection
+	$gql = "query $queryNameSection { $gqlField( $argsText ) $selection }"
+
+	$bodyObj = @{ query = $gql }
+
+	$hHeaders = @{ 'Content-Type' = 'application/json'; 'Authorization' = "Bearer $tokenValue" }
+
+	try {
+		$resp = Invoke-RestMethod -Method Post -Uri $requestUrl -Headers $hHeaders -Body ( $bodyObj | ConvertTo-Json -Depth 10 ) -ErrorAction Stop
+		Write-Output "Query '$queryNameSection' -> $requestUrl : OK"
+
+		# Write results to CSV if OutPath is provided
+		if ($OutPath) {
+			if (-not (Test-Path -Path $OutPath)) {
+				try { New-Item -ItemType Directory -Path $OutPath -Force | Out-Null } catch {}
+			}
+
+			$fields = @('entityId')
+			if ($qcfg.ContainsKey('__lines')) {
+				$lines = $qcfg['__lines'] | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+				if ($lines.Count -gt 0) { $fields = $lines }
+			}
+
+			# Extract records from response
+			$dataRoot = $null
+			if ($resp -and $resp.data) {
+				$dataRoot = $resp.data | Select-Object -ExpandProperty $gqlField -ErrorAction SilentlyContinue
+			}
+			if ($null -eq $dataRoot) {
+				Write-Output "Query '$queryNameSection' : no data returned"
+			} else {
+				$records = $dataRoot
+				if (-not ($records -is [System.Collections.IEnumerable]) -or ($records -is [string])) {
+					$records = @($records)
+				}
+
+				$linesOut = @()
+				$linesOut += ($fields | ForEach-Object { $_ }) -join ','
+				foreach ($rec in $records) {
+					$row = @()
+					foreach ($f in $fields) {
+						$val = $null
+						if ($rec -is [psobject] -and $rec.PSObject.Properties.Name -contains $f) {
+							$val = $rec.$f
+						}
+						$row += (Escape-CsvValue $val)
+					}
+					$linesOut += ($row -join ',')
+				}
+
+				$today = Get-Date -Format 'yyyy-MM-dd'
+				$fname = "$today $Instance $queryNameSection.csv"
+				$outFile = Join-Path $OutPath $fname
+				$linesOut | Set-Content -Path $outFile -Encoding UTF8
+				Write-Output "Query '$queryNameSection' -> wrote $(($records.Count)) rows to $outFile"
+			}
+		}
+	} catch {
+		Write-Output "Query '$queryNameSection' -> $requestUrl : FAILED - $($_.Exception.Message)"
+	}
+}
+
+# Optional beep before exit (cross-platform: bell character works on Linux/Windows)
+if ($Beep) {
+	Write-Host $([char]7) -NoNewline
 }
 
 exit 0

@@ -307,8 +307,16 @@ foreach ($qKey in $queryNames) {
 	# Build request URL: graphqlEndpoint + endpointName
 	$requestUrl = $graphqlEndpoint.TrimEnd('/') + '/' + $endPointName.TrimStart('/')
 
-	# Build args text (string values quoted)
-	$argsText = "viewId: `"$viewId`", filterId: `"$filterId`", treeviewPath: `"$treeviewPath`""
+	# Build args text (only include non-empty values)
+	$argParts = @()
+	if ($viewId) { $argParts += "viewId: `"$viewId`"" }
+	if ($filterId) { $argParts += "filterId: `"$filterId`"" }
+	if ($treeviewPath) { $argParts += "treeviewPath: `"$treeviewPath`"" }
+	if ($argParts.Count -gt 0) {
+		$argsText = "( " + ($argParts -join ', ') + " )"
+	} else {
+		$argsText = ''
+	}
 
 	# Determine selection set: if the query section contains free-form lines (under __lines), treat them as field names (one per line)
 	$selection = "{ entityId }"
@@ -321,7 +329,7 @@ foreach ($qKey in $queryNames) {
 	}
 
 	# Build GraphQL operation using selection
-	$gql = "query $queryNameSection { $gqlField( $argsText ) $selection }"
+	$gql = "query $queryNameSection { $gqlField$argsText $selection }"
 
 	$bodyObj = @{ query = $gql }
 
